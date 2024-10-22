@@ -15,3 +15,5 @@ elementData = (E[]) new Object[10];
 
 ### Ассимптотика
 ![[Pasted image 20240925164805.png]]
+
+### Потокобезопасный вариант - [[CopyOnWriteArrayList]]
