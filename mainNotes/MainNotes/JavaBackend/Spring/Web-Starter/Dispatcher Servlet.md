@@ -32,7 +32,7 @@ Handler Adapter интересен тем, что он включает в се�
 
 doDispatch вызывается из метода doService, который вызывается из метода service. И если по нему походить, то увидим, что он соответствует той логике, которую мы описывали выше.
 
-
+**![Dispatcher-servlet-diagram](https://lh7-rt.googleusercontent.com/docsz/AD_4nXeR8H_wjAB8oFHenlSpXrmhoFShUJyj6jVn2LNUEzsjAJhsZ0mIqvdvOyZwAxq5rWWogh6myVcp7Lj2sf06jk6PUVouXaoIBwUNkfyc_KfJxjGv8r80L5HNtlI3cJbi6iE4ZKYfwDNIduHxQjpk1VpmseU?key=XMeQwLql_JMyD2k54CogZg)**
 
 
 
