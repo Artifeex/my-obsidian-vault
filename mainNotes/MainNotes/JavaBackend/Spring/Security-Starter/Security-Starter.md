@@ -227,4 +227,4 @@ password = null, потому что сразу же после успешной
 
 [[OAuth2]]
 
-[[MainNotes/JavaBackend/JWT]]
+[[MainNotes/Web/JWT]]
