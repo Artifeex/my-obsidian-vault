@@ -207,3 +207,31 @@ Eureka - это полноценное приложение. Мы создаем
 ### Spring Cloud API Gateway
 Когда клиент делает запрос, то ему нужно знать точку входа - этой точкой и является Spring Cloud API Gateway, внутри которого есть встроенный Load Balancer. IP адреса для отправки клиентских запросов на конкретные микросервисы Gateway получает из Eureka. Помимо этого у него есть доп функционал. Мы можем писать фильтры и добавлять новый функционал(похоже на фильтры из сервлетов), т.к. все запросы приходят на Gateway и выходят также из него! 
 ![[Pasted image 20241116202914.png]]
+
+
+### Мы можем включить автоматический routing в нашем приложении ApiGateway
+Для этого нужно использовать в настройках 
+spring.cloud.gateway.discovery.locator.enabled=true
+### Чтобы приложение каждый раз стартовало с рандомным портом, нужно в application.yml указать port : 0. Тогда мы сможем запускать несколько инстансов одного сервиса и у них будут разные порты, что важно, т.к. мы не можем запустить один и тот же сервис с одним и тем же портом 
+![[Pasted image 20241118151128.png]]
+Но чтобы в Eureka могли регаться сразу несколько микросервисов одного и того же приложения, то нужно добавить доп настройку в микросервис:
+![[Pasted image 20241118151942.png]]
+В dashboard у нас будет благодаря этому будет 2 микросервиса! Если мы так не сделаем, то при запуске еще одного инстанса одного и того же микросервиса из-за того, что id по умолчанию равно имени приложения, то просто перетрется информация по прошлому инстансу
+![[Pasted image 20241118152432.png]]
+
+### Load Balancing
+По дефолту Spring Cloud Api Gateway использует встроенный Load Balancer - Ribbon.
+
+
+### Axon Server
+Axon Server можно всячески конфигурировать. Для этого нужно просто создать .properteis файлик в директории configuration. И запустить axon server java -jar aonserver.jar - но это если мы скачали jar-ник с axon сайта. 
+https://docs.axoniq.io/axon-server-reference/v2024.1/axon-server/administration/admin-configuration/configuration/
+![[Pasted image 20241118160346.png]]
+Наиболее простые настройки, чисто для примера:
+![[Pasted image 20241118160359.png]]
+devmode - нужен для того, чтобы появилась кнопка в dashboard axona, чтобы можно было вручную чистить Event Store.
+
+Запуск в докере
+docker run --name axonserver -p 8024:8024 -p 8124:8124 -v "/home/user/IdeaProjects/docker-data/data":/axonserver/data -v "/home/user/IdeaProjects/docker-data/eventdata":/axonserver/eventdata -v "/home/user/IdeaProjects/docker-data/config":/axonserver/config axoniq/axonserver
+![[Pasted image 20241118161615.png]]
+И потом в диреткории config мы создаем файлик axonserver.properties и там прописываем пропертис
