@@ -234,4 +234,348 @@ devmode - нужен для того, чтобы появилась кнопка
 Запуск в докере
 docker run --name axonserver -p 8024:8024 -p 8124:8124 -v "/home/user/IdeaProjects/docker-data/data":/axonserver/data -v "/home/user/IdeaProjects/docker-data/eventdata":/axonserver/eventdata -v "/home/user/IdeaProjects/docker-data/config":/axonserver/config axoniq/axonserver
 ![[Pasted image 20241118161615.png]]
-И потом в диреткории config мы создаем файлик axonserver.properties и там прописываем пропертис
+И потом в диреткории config мы создаем файлик axonserver.properties и там прописываем настройки.
+
+Конвенция для имени команд.
+![[Pasted image 20241119090748.png]]
+Например: Create(verb) + Product(noun) + Command = CreateProductCommand
+
+Command - это просто POJO, в котором мы храним всю необходимую информацию для выполнения команды + id, который нужен для Axon, чтобы решать к какому объекту относится команда. Например, для создания продукта мы в command храним:
+![[Pasted image 20241119091520.png]]
+
+В команде по созданию продукта как раз храним такие же поля, т.к. они нужны для создания объекта Product:
+![[Pasted image 20241119091107.png]]
+
+В контроллере мы создаем объект команды и затем отправляем эту команду в Command Gateway, которая отправляет команду в  Command Bus по которой отправляются команды в обработчик команд!
+
+Можно думать об Command Gateway - как об API, который позволяет отправлять команды.
+А Command Bus приинмает эти команды и направляет уже в обработчики команд, которые мы напишем! Т.е. это диспетчек команд, как диспатчер сервлет, который принимает все запросы и направляет их в соответствующие контроллеры. Если для Command Bus не будет Command Handlera, который обрабатывает данную команду, то будет выброшено исключение.
+Вот такая схемка:
+![[Pasted image 20241119092243.png]]
+
+Вот так выглядит контроллер пока что. Создали команду и отправили ее через commandGateway, который получили из DI.
+![[Pasted image 20241119094022.png]]
+
+
+У commandGateway есть два основных метода:
+- send - отправили команду и нам возвращается CompletableFuture, который мы сможем использовать потом, когда команда выполнится.
+- sendAndWait - отправили команду и ждем результата. Т.е. это блокирующий вызов.
+![[Pasted image 20241119092636.png]]
+
+### Aggregate класс
+Aggregate класс - это сердце нашего приложения. Разберем его на примере Product. Он хранит внутри себя:
+- Текущее состояние Product, т.е. как раз те поля title, price, quantity, которые мы определили для нашего продукта.
+- Command Handlers - это те команды, которые будут поступать из Command Bus в наш Aggregate Object.
+- Business Logic - при обработки команды может быть выполнена различная бизнес логика. Это может быть валидация, т.е. может быть попытка создать некорректный Product объект и тут же и будет вынесено решение о том, чтобы не создавать невалидный объект.
+- Event Sourcing Handlers Methods - они обрабатывают events, который приходят из Event Store для восстановления объекта. Axon сначала создает полностью пустой Aggregate object, в котором пустое состояние. И дальше он использует Event Store из которого забирает events, связанные с aggregate object и выполняет events для того, чтобы реконструировать объект. Т.е. если пришла команда UpdateProductCommand, то для ее выполнения нужно сначала восстановить состояние Product перед тем как вызвать обновление.
+![[Pasted image 20241119093209.png]]
+
+![[Pasted image 20241119135628.png]]
+
+Создадим aggregate класс для Product и в конструкторе обработаем в нем CreateProductCommand:
+![[Pasted image 20241119100301.png]]
+После валидации, если все прошло хорошо, то мы должны сделать publish event, чтобы о создании event все узнали! 
+Именование для events:
+![[Pasted image 20241119100234.png]]
+В случае создания Product: ProductCreatedEvent
+
+Создаем объект eventa, в нем мы сами решаем, что хотим хранить. В случае создание нам нужно сохранить все данные для того, чтобы в Query части нашего CQRS приложение можно было сохранить этот Product в БД, а для этого нужна вся информация!
+![[Pasted image 20241119100718.png]]
+
+Теперь мы должны запаблишить этот event. Сделаем это после валидации в конструкторе, который обрабатывает CreateProductCommand. Для этого создаем сам объект event, а потом используем AggregateLifecycle.apply метод, который публикует этот event. Но важно, что сначала этот event доходит до EventHandlers ВНУТРИ НАШЕГО ProductAggregate, чтобы мы могли узнать об этом изменении для изменения ProductAggregate объекта, а только потом он уходит наружу для других EventHandlers других классов!
+![[Pasted image 20241119101241.png]]
+
+Теперь напишем в ProductAggregate EventHandler, который обработает productCreatedEvent, который мы отправили вызовом AggregateLifecycle.apply
+
+По Axon конвенции мы называем методы on и вешаем аннотацию @EventSourcingHandler в котором принимаем event, который обрабатываем. Внутри обработчиков мы должны быть нацелены только на обновление внутреннего состояние AggregateObject, а не выполнять какую-то бизнес логику! Для бизнес логики используем обработчик команд. Вот так выглядит метод, который будет обрабатывать productCreatedEvent внутри ProductAggregate:
+![[Pasted image 20241119102153.png]]
+Также мы внутри ProductAggregate храним состояние для Product, которое и будем обновлять внутри EventHandlers. И стоит заметить, что мы должны использовать productId и аннотацию @AggregateIdentifier! С помощью этого поля Axon как раз и понимает, как связать команду, которая к нему пришла с Aggregate объектом, внутри которого есть обработчики команд, которые будут обрабатывать эту команду.
+![[Pasted image 20241119102135.png]]
+
+Таким образом, что имем?
+POST запрос приходит в контроллер, там мы создаем CommandCreateProduct и отправляем через CommandGateway эту команду. У команды должно быть поле:
+```java
+@TargetAggregateIdentifier 
+private final String productId;
+```
+Чтобы Axon мог связать команду и AggregateObject.
+Эта команда приходит в AggregateObject, в котором есть метод(или конструктор, как было в случае CreateProductCommand), помеченный аннотацией @CommandHandler и который в качестве параметра принимает эту команду. В нем мы выполняем всю бизнес логику, которую хотим - валидируем, например. 
+
+И после этого, если все хорошо, то мы паблишим event через AggregateLifecycle.apply(), который сначала выполняется для методов, которые слушают Event внутри AggregateObject класса(такие методы помечены аннотацией @EventSourcingHandler), а потом уже публикуется для других слушателей event-а.
+
+Далее выполняется код в @EventSourcingHandler, внутри которого мы обновляем внутреннее состояние AggregateObject. Также обязательное поле:
+```java
+@AggregateIdentifier  
+private String productId;
+```
+
+### Теперь поработем с Query частью нашего CQRS
+Мы научились немного работать с Command частью, теперь же нам нужно написать Query часть, которая будет сохранять product в БД. Помечаем аннотацией Component и создаем метод, который помечен @EventHandler для обработки ProductCreatedEvent и сохраняем его через обычный Jpa репозиторий.
+![[Pasted image 20241119132738.png]]
+
+Важно, что при старте нашего приложения @HandlerEvents автоматически начинает обрабатывать ивенты, которые не были обработаны ранее.
+
+Для подключения к веб-интерфейсу h2 консоли используется /h2-console путь, но перед ним, если мы используем spring cloud api gateway, то нужно также указывать необходимый url.
+
+Теперь реализуем схему с получением данных.
+![[Pasted image 20241119132947.png]]
+
+![[Pasted image 20241119135757.png]]
+Стоит заметить, что у Query нет прослойки в виде Even Bus, как у Command API. 
+
+В случае Query у нас приходит запрос на контроллер, в контроллере мы создаем Query объект(аналогия с Command объектом) и в этот Query объект мы уже помещаем информцию, которая необходима для query запроса(например, если реализуем пагинацию, то какую страницу отобразить и количество страниц). 
+
+Созданный Query объект. Причем есть конвенция, которая также представлена на скрине:
+![[Pasted image 20241119140230.png]]
+
+QueryController, который как раз создает объект FindProductsQuery и передает его через gateway. В метод query вторым параметром передается то, что должен вернуться обработчик query. Т.к. нам нужен список, то мы используем ResponseTypes.multipleInstances. А возвращается нам future, поэтому join.
+![[Pasted image 20241119140321.png]]
+
+
+И дальше этот Query отправляем через QueryGateway на обработку в метод, помеченный аннотацией @QueryHandler(аналогия с @CommandHandler, который есть внутри AggregateObject). Внутри него мы общаемся с репозиторием и возвращаем то, что хотели вернуть из Query.
+
+А вот и сам класс, внутри которого есть @QueryHandler метод
+![[Pasted image 20241119140539.png]]
+
+
+### Валидация информации перед сохранением в БД
+
+#### Bean Validation
+Сначала проверим переданные поля, т.е. произведем раннюю валидацию.
+Используем Hibernate Validation(помечаем аннотациями поля)
+![[Pasted image 20241119141553.png]]
+Документация:
+https://hibernate.org/validator/documentation/
+
+Вот такой прикольный вывод ошибок мы получим, если включим две настройки в application.yml:
+server:  
+  error:  
+    include-message: always  - добавляеn message в response(на скрине увидишь)
+    include-binding-errors: always - добавляем errors(на скрине также увидишь)
+![[Pasted image 20241119144502.png]]
+
+#### Command Validation
+Также валидация может потребоваться для команды, которую мы получили в @CommandHandler. Важно, что валидация должна происходить до того, как отправится Event. Зачем такая валидация? Она чаще всего используется для того, чтобы проверить, можно ли выполнить такую команду, основываясь на текущем состоянии AggregateObject. Например, пришла команда ReserveProductCommand - которая говорит, чтобы мы зарезервировали Product. Мы смотрим на текущее состояние нашего AggregateObject и если count у него меньше, чем хотят зарезервировать, то выбрасываем исключение!
+
+Пример валидации, но конкретна этот вариант бесполезный, поскольку мы проверяем это на этапе Bean Validation(Hibernate Validator).
+![[Pasted image 20241119144830.png]]
+
+
+#### Message Dispatch Interceptor
+Это еще один способ провалидировать команду. Но теперь уже не в @CommandHandler, а на этапе перед попаданием команды в Command Bus, а, значит, перед попаданием в метод @CommandHandler. Т.е. этот interceptor будет вызываться, когда мы будем отправлять команду через CommandGateway.
+![[Pasted image 20241119145448.png]]
+Что мы можем сделать в этом interceptore?
+- Провалидировать команду
+- Добавить в message какую-нибудь метаинформацию или прологировать команду!
+- Заблокировать команду, выбросив исключение
+
+Как реализовать Interceptor?
+Создаем класс и реализуем MessageDispatchInterceptor
+```java
+@Component  
+@Slf4j  
+public class CreateProductCommandInterceptor implements MessageDispatchInterceptor<CommandMessage<?>> {  
+  
+    //Должен вернуть BiFunction, которая будет обрабатывать команду  
+    //Integer - command index    // CommandMessage - result of the function    @Nonnull  
+    @Override    public BiFunction<Integer, CommandMessage<?>, CommandMessage<?>> handle(  
+            @Nonnull List<? extends CommandMessage<?>> messages  
+    ) {  
+        return (index, command) -> {  
+  
+            //прологируем вызванную команду  
+            log.info("Intercepted Command: " + command.getPayload());  
+  
+  
+            //Т.к. данный interceptor будет срабатывать для всех команд, которые мы отправляем, то должны проверить  
+            //что это нужная команда.            if(CreateProductCommand.class.equals(command.getPayloadType())) {  
+                if(command.getPayload() instanceof CreateProductCommand createProductCommand) {  
+  
+                    //Такую валидацию делаем чисто для примера, понятно, что это все можно проверить на этапе BeanValidation  
+                    if(createProductCommand.getPrice().compareTo(BigDecimal.ZERO) <= 0) {  
+                        throw new IllegalArgumentException("Price must be greater than zero");  
+                    }  
+  
+                    if(createProductCommand.getTitle() == null || createProductCommand.getTitle().isEmpty()) {  
+                        throw new IllegalArgumentException("Title can't be null or empty");  
+                    }  
+                }  
+            }  
+  
+            return command;  
+        };  
+    }  
+}
+```
+Но, чтобы он заработал мы должны зарегистрировать его(Создаем такой метод в любом @Configuration классе. Например, в main классе, где запускаем Spring приложение):
+```java
+// Мы должны зарегистрировать interceptor в CommandBus, чтобы он заработал  
+@Autowired  
+public void registerCreateProductCommandInterceptor(ApplicationContext context,  
+                                                    CommandBus commandBus) {  
+    commandBus.registerDispatchInterceptor(  
+            context.getBean(CreateProductCommandInterceptor.class)  
+    );  
+  
+}
+```
+
+#### Как проверить перед сохранением объекта, что такой объект еще не существует?
+Проблема в том, что мы разделили Command и Query. Сохраняем объект мы в Command части, но нам нужно в ней же сделать запрос, которым проверить нет ли такого объекта в БД? Но как мы должны это сделать, вызовом Query? Или самим сходить в Repository? Или какой-то другой вариант? 
+
+Эта проблема описана в одной из статьей на Axon сайте.
+![[Pasted image 20241119161549.png]]
+
+Для решения этой проблемы мы заведем в Command части приложения еще одну БДшку - Lookup DB. Она будет хранить только productId и title! А все другие поля она не будет хранить, т.к. единственная цель этой БД - дать нам возможность в Command проверить при создании или обновлении Product, что такой Product существует. Но где мы будем это проверять ? Мы будет это проверять как раз в Interceptore, который написали ранее, который выполняется до того, как Command попадет в CommandHandler. 
+
+Еще важно то, что наша Lookup табличка должна быть синхроинизированна с другой основной БД, т.е. чтобы данные в них по id и title совпадали(title у нас хранится в lookup, поскольку мы указали, что он unique, поэтому также нужно проверять.). Чтобы не было такого, что в lookup страничке нет какой-то инфы, либо наоборот. 
+
+Т.е. мы дожны сохранять изменения как в lookup табличку, так и в основную БД. С основной БД понятно, когда все с командной хорошо, то паблишим event с изменением и потом в EventHandler обновляем БД. Но как поступить с lookup? А для нее мы также будем генерировать event для сохранения и в EventHandlere обрабатывать, но уже этот EventHandler будет в Command.
+![[Pasted image 20241119162017.png]]
+
+Создаем Entity, которую будем хранить в Lookup table:
+```java
+@Data  
+@Entity  
+@Table(name = "productlookup")  
+public class ProductLookupEntity implements Serializable {  
+  
+    private static final long serialVersionUID = -1040059442356059255L;  
+  
+    @Id  
+    @Column(unique = true)  
+    private String productId;  
+    @Column(unique = true)  
+    private String title;  
+}
+```
+И репозиторий:
+![[Pasted image 20241119164403.png]]
+
+@ProcessingGroup("product-group") - для логического объединения всех EventHandlers, которые обрабатывают events, связанные с Product.
+Axon для каждой такой группы создает отдельный tracking event processor. Этот tracking event processor будет использовать специальный tracking token, который будет использовать для избежания множественной обработки одного и того же эвента в разных тредах и нодах. Также этот механизм используется для Rollback операций. (Стоит почитать отдельно, зачем это нужно). 
+
+Как я понял - это еще нужно для того, чтобы в том потоке, в котором инициировался этот event выполнилась и его обработка, чтобы не было такого, что мы в нашем потоке создали эвент, а он обработался и другим потоком и нашим. Но лучше реально почитать об этом...
+
+Но похоже поведение зависит еще и от типа Tracking Event Processor. 
+
+ProductLookupEventsHandler - event handler на событие CreateProductEvent. Он должен добавить в lookup БД новую сущность. Почему он не проверяет? Потому что мы делаем проверку на то, существует сущность или нет в interceptore, который вызывается раньше, чем EventHandler. 
+```java
+@Component  
+@ProcessingGroup("product-group") // чтобы логически объединить все handler-ы, которые обрабатывают Product эвенты в одну группу  
+@RequiredArgsConstructor  
+@Slf4j  
+public class ProductLookupEventsHandler {  
+  
+    private final ProductLookupRepository productLookupRepository;  
+  
+    @EventHandler  
+    public void on(ProductCreatedEvent productCreatedEvent) {  
+        log.error("ProductLookupEventsHandler");  
+  
+        ProductLookupEntity productLookupEntity = new ProductLookupEntity(  
+                productCreatedEvent.getProductId(), productCreatedEvent.getTitle()  
+        );  
+        productLookupRepository.save(productLookupEntity);  
+    }  
+}
+```
+
+Код interceptora, который проверяет нет ли такой сущности уже в БД. Если есть, то выбрасывает исключение, а значит event-ы, которые инициируются уже после interceptora не будут вызваны.
+```java
+@Component  
+@Slf4j  
+@RequiredArgsConstructor  
+public class CreateProductCommandInterceptor implements MessageDispatchInterceptor<CommandMessage<?>> {  
+  
+    private final ProductLookupRepository productLookupRepository;  
+  
+    //Должен вернуть BiFunction, которая будет обрабатывать команду  
+    //Integer - command index    // CommandMessage - result of the function    @Nonnull  
+    @Override    public BiFunction<Integer, CommandMessage<?>, CommandMessage<?>> handle(  
+            @Nonnull List<? extends CommandMessage<?>> messages  
+    ) {  
+        return (index, command) -> {  
+  
+            //прологируем вызванную команду  
+            log.info("Intercepted Command: " + command.getPayload());  
+              
+            //Т.к. данный interceptor будет срабатывать для всех команд, которые мы отправляем, то должны проверить  
+            //что это нужная команда.            if (CreateProductCommand.class.equals(command.getPayloadType())) {  
+                if (command.getPayload() instanceof CreateProductCommand createProductCommand) {  
+                    ProductLookupEntity entity = productLookupRepository.findByProductIdOrTitle(  
+                            createProductCommand.getProductId(),  
+                            createProductCommand.getTitle()  
+                    );  
+                    if (entity != null) {  
+                        throw new IllegalStateException(  
+                                String.format("Product with productId %s or title %s already exists.",  
+                                        createProductCommand.getProductId(), createProductCommand.getTitle())  
+                        );  
+                    }  
+                }  
+            }  
+  
+            return command;  
+        };  
+    }  
+}
+```
+
+ProductEventsHandler - для сохранения Product в основную БД приложения.
+```java
+//также часто называют ProductProjection  
+@Component  
+@RequiredArgsConstructor  
+@ProcessingGroup("product-group")  
+@Slf4j  
+public class ProductEventsHandler {  
+  
+    private final ProductsRepository productsRepository;  
+  
+    @EventHandler  
+    public void on(ProductCreatedEvent event) {  
+  
+        log.error("ProductEventsHandler");  
+        ProductEntity product = new ProductEntity();  
+        BeanUtils.copyProperties(event, product);  
+  
+        productsRepository.save(product);  
+    }  
+}
+```
+
+Логика, которую имеем.
+Приходит POST запрос от клиента о создании объекта. Мы создаем command CreateProductCommand и с помощью CommandGateway отпраляем ее на обработку. У нас есть interceptor, который вызывается для каждой команды и для CreateProductCommand проверяет, нет ли в Lookup БД уже такой сущности. Если она есть, значит, ошибка, т.к. создавать дубликаты запрещено. Говорим пользователю об ошибке и заканчиваем работу. После прохождения interceptora команда идет в AggregateObject, конструктор которого помечен аннотацией CommandHandler и он хендлит эту команду. После чего вызывает event через AggregateLifecycle, который сначала попадает в @EventSourcingHandler, в котором обновляются поля для AggregateObject. После чего этот эвент попадает в ProductLookupEventsHandler для сохранения нового Product в Lookup БД, а потом в ProductEventsHandler и сохраняется уже в полноценную БД для Query.
+
+### Error Handling
+Научимся наконец-то отменять изменения в БД. Т.е. если вдруг в Evente(а это уже последний этап, где мы реально уже изменяем в БД данные) произошла ошибка.
+Для начала научимся отменять изменения внутри одного микросервиса, а потом уже и для распределенных транзакций с сага.
+
+В try catch, который мы можем повесить в controller или используя @ControllerAdvice мы можем отлавливать ошибки, которые произошли в контроллере, в interceptore или в CommandHandlere. Но мы не можем обработать ошибку, которая произошла в EventHandler. Причем стратегия ошибок в Event Handlers такая, что если выбросилось исключение, то сообщение об ошибке запоминается, но выполнение ПРОДОЛЖАЕТСЯ В ДРУГИХ Event Handlers. Т.е. в моем handlere произошла ошибка и я дальше выполниться не смог, а вот другие без проблем смогут обрабатывать этот event, хотя это неправильно! Мы должны остановить обработку ошибочного эвента.
+
+Причем commandHandler, который вызвал publish эвента уже никак не реагирует, для него все закончилось хорошо и в Controller не вернется никакой ошибки и мы отправим пользователю успешный ответ, хотя на самом деле в Event Handlere произошла ошибка!
+
+Нам никто не мешает исползовать try catch внутри Event Handler методов, но проблема в том, что об этой ошибке никак не узнает controller. А мы бы хотели, чтобы она дошла до контроллера и была обработана! Для этого нужно будет использовать ListenerInvocationErrorHandler
+
+Благодаря нему, когда ошибка произойдет, то мы остановим выполнение того Event Handlera, в котором произошла ошибка, а также остановим выполнение других Event Handlers, которые также обрабатывали этот event!!! А также сможем вернуть ошибку RestController классу и он вернет пользователю сообщение об ошибке! А также вся транзакция сделает rollback и откатятся все изменения! 
+
+И чтобы все это работало нам и нужно, чтобы Event Handlers, которые обрабатывают одни и те же events находились в одной группе, которую обрабатывает Subscribing Event Processor.
+![[Pasted image 20241119181432.png]]
+
+### Что такое event processor?
+Event Processor - это компонент, который направлен на выполнение технических аспектов, связанных с предоставлением эвентов до наших event handlers!
+Есть два вида event processors:
+![[Pasted image 20241119182202.png]]
+#### Tracking
+Это такой event processor, который работает в отдельном потоке от потока, который создает эвенты. Он забирает сообщения из источники эвентов.
+
+Если произойдет ошибка, то он перейдет в Error мод Он отпустит token и затем будет пытаться выполнить этот эвент еще раз с увеличивающимся периодом, начиная с 1 секунды до 60 секунд. Т.е. он попробует перевыполнить event, если не получилось, то он удваивает время через которое попробует еще раз, т.е. уже через 2 секунды и снова попробует выполнить, если не получилось, то через 4 секунды и т.д. до того, пока не превысит 60 секунд.
+Зачем такие периоды ожидания? Они нужны для того, чтобы если вдруг другая node сможет обработать event, то она смогла запросить token у нашего Tracking Processor-a и завершить обработку eventa.
+#### Subscribing
+Это такой event processor, который работает в том же потоке, который создает эвенты! Т.е. грубо говоря, в Aggregate мы вызвали event и этот же поток, который создает event отвечает и за доставку этого эвента в @EventHandler.
+
+Если прозойдет ошибка, то сообщит о ней в компонент, который предоставил этот event(до паблишера этого эвента). Т.е. Subscribing позволит паблишеру обработать ошибку. Если мы распространим(propagate) ошибку до конца, то сможем откатить ее!
+
+В курсе мы будем для отката ошибки использовать Subscribing вариант.
+
