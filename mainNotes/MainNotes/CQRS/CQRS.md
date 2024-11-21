@@ -1,3 +1,19 @@
+### Конвенции именования
+#### Command
+ Create(verb) + Product(noun) + Command = CreateProductCommand
+#### Query
+FindProductsQuery
+#### Event
+ProductCreatedEvent
+#### Event Handler Method
+```java
+@EventHandler
+public void on(ProductCreatedEvent productCreatedEvent) {
+
+}
+```
+
+
 ### Что такое микросервисы?
 ![[Pasted image 20241115115220.png]]![[Pasted image 20241115115346.png]]
 Spring Cloud - это environment, который предоставляет множество услуг для микросервисов, написанных на SpringBoot.
@@ -579,3 +595,228 @@ Event Processor - это компонент, который направлен �
 
 В курсе мы будем для отката ошибки использовать Subscribing вариант.
 
+#### Что будет, если выбросить исключение в CommandHandler или QueryHandler?
+Axon Framework оборачивает исключение либо в CommandExecutionException либо в QueryExecutionException в зависимости от того, где произошло исключение. 
+
+Несмотря на то, что код с выбрасыванием исключения, идет после вызова метода apply, productCreatedEvent не запаблишится.
+Axon Framework не сразу начинает выполнять передачу eventa, а сохраняем эвент для последующего выполнения, поэтому если потом выбросилось исключение, то productCreatedEvent не будет сохранен в Event Store и произойдет Rollback
+![[Pasted image 20241120103741.png]]
+И мы можем отловить ошибку, которая произошла в CommandHandlere в нашем @RestControllerAdvice:
+Отловим эту ошибку
+![[Pasted image 20241120110537.png]]
+И в ответе видим, что в message у нас пишется, что ошибка произошла в @CommandHandler
+![[Pasted image 20241120110523.png]]
+
+#### А как обработать исключение, которое произошло глубже в EventHandlere, а не в CommandHandlere? Как мы говорили ранее, такое исключение уже не поднимается до @RestControllerAdvice или CommandHandler(без дополнительного кода)
+Самый просто вариант внутри EventHandlera использовать try catch, а также, у нас есть аннотация @ExceptionHandler(но теперь не от Spring, а от Axon Framework). Работает аналогично, если где-то в EventHandlere выбросится исключение, то мы его можем обработать в методе с аннотацией  @ExceptionHandler
+
+```java
+@Component  
+@RequiredArgsConstructor  
+@ProcessingGroup("product-group")  
+@Slf4j  
+public class ProductEventsHandler {  
+  
+    private final ProductsRepository productsRepository;  
+  
+    @ExceptionHandler(resultType = IllegalArgumentException.class)  
+    public void handle(IllegalStateException ex) {  
+        //log error message  
+    }  
+  
+    @ExceptionHandler(resultType = Exception.class)  
+    public void handle(Exception ex) {  
+        //log error message  
+    }  
+  
+    @EventHandler  
+    public void on(ProductCreatedEvent event) {  
+  
+        log.error("ProductEventsHandler");  
+        ProductEntity product = new ProductEntity();  
+        BeanUtils.copyProperties(event, product);  
+  
+        productsRepository.save(product);  
+    }  
+}
+```
+Важно, что эти хендлеры работают только внутри этого класса! Т.е. если в другом EventHandlere произойдет исключение, то они не обработают его.
+
+НОО, если мы хотим, чтобы rollback прозошел и отменились все изменения, которые выполнились, то мы не должны их обрабатывать так, или же обрабатывать для логирования, но потом пробрасывать снова, чтобы, используя, доп механизмы это исключение всплыло наверх!
+
+Это возможно, если для нашей группы events, мы используем subscribe event processor, потому что как мы узнали, subsribe event processor работает в том же потоке, в котором эти эвенты и генерируются и выполняются и поэтому он может выполнить rollback.
+
+Для обработки ошибок в эвентах мы можем как написать кастомный обработчик, так и использовать стандартный, если нам не нужен никакой дополнительный функционал.
+
+Для примера напишем кастомный, но он по сути делает то же самое, что и стандартный - пробрасывает исключение дальше, но при желании могли добавить какую-то логику.
+```java
+public class ProductsServiceEventsErrorHandler implements ListenerInvocationErrorHandler {  
+  
+    @Override  
+    public void onError(@Nonnull Exception exception,  
+                        @Nonnull EventMessage<?> event,  
+                        @Nonnull EventMessageHandler eventHandler  
+    ) throws Exception {  
+        throw exception;  
+    }  
+}
+```
+И чтобы он заработал, нам нужно его зарегистрировать, также есть закомментированный код, который показывает, как взять стандартный обработчик.
+```java
+    //Регистрируем EventErrorHandler  
+    @Autowired  
+    public void configure(EventProcessingConfigurer configurer) {  
+        configurer.registerListenerInvocationErrorHandler(  
+                "product-group",  
+                conf -> new ProductsServiceEventsErrorHandler()  
+        );  
+  
+        //если нам не нужен кастомный EventHandler, а просто хотим, чтобы произошел Exception Propagation и выполнился rollback,  
+        // то можем использовать стандартный, который предлагает нам Axon - PropagationErrorHandler.INSTANCE  
+//        configurer.registerListenerInvocationErrorHandler(  
+//                "product-group",  
+//                conf -> PropagatingErrorHandler.INSTANCE  
+//        );  
+    }
+```
+
+Это все, что нужно, чтобы выполнить rollback транзакции(на самом деле, действия с БД даже не выполняются, т.е. если в debug моде пройтись и после вызова, например, метода save на репозитории посмотреть в БД, то там не будет изменений!) Также в EventStore не сохраняется эвент, который вызвал ошибку в EventHandlere.
+
+Т.е. сейчас схема такая, что если выбросилось исключение в EventHandlere, то это исключение сначала перехватывается внутри @ExceptionHandler(который находится внутри класса, обрабатывающего исключения). Он пробрасывает это исключение еще выше, и оно попадает в класс, который реализует интерфейс ListenerInvocationErrorHandler, в котором мы также может что-нибудь сделать и должны пробросить его еще выше. После чего произойдет отмена изменений и exception пробросится на самый верх в @ControllerAdvice, в котором мы отлавливаем Exception. В каком из методов? В методы, который отлавливает CommandExecutionException.
+
+### Saga Orchestration-based Saga
+Saga - может быть как отдельным микросервисом, так и частью другого микросервиса. Чаще используется, когда она является частью. Но в какой микросервис ее добавить ? Добавляют в тот микросервис, который является стартом flow приложения. Например, если у нас сначала создается заказ в OrderService, потом выполняется код в ProductsService и потом уже PaymentService, то Saga добавляется к OrderService, т.к. он является стартовой точкой.
+
+![[Pasted image 20241120143016.png]]
+
+Сага класс помечается аннотацией @Saga.
+Методы, которые ловят различные эвенты помечаются аннотацией @SagaEventHandler.
+
+Также есть два метода, которые помечаются:
+@StartSaga - данный метод по сути создает instance Saga. Т.е. когда приходит OrderCreatedEvent, то тогда и создается сага объект, если бы пометили какой-то другой метод, который принимает другой эвент, то сага instance создавался бы в том случае, когда приходил бы другой эвент. 
+
+@EndSaga - помечается метод, принимающий эвент, после которого сага и ее транзакция является успешной и в дальнешем эвенты не будут обрабатывать этим saga instance.
+
+Другими словами 
+@StartSaga - начинает Saga Lifecycle
+@EndSaga - оканчивает Saga Lifecycle
+
+associationProperty - это проперти, по которому Axon Framework должен понять, какому saga инстансу передавать обработку эвента. У нас же может быть одновременно много saga instance, которые обрабатывают эвенты.
+
+
+
+![[Pasted image 20241120151628.png]]
+
+Saga.associateWith - и можем связать наш инстанс саги с еще каким-то ключом и значением!
+
+Создали в OrdersService класс OrdersSaga, который принимает event и через commandGateway отправляет ReserveProductCommand, которую обрабатывает ProductAggregate
+```java
+@Saga  
+@Slf4j  
+public class OrdersSaga {  
+  
+    @Autowired  
+    private transient CommandGateway commandGateway;  
+  
+    @StartSaga  
+    @SagaEventHandler(associationProperty = "orderId")  
+    public void handle(OrderCreatedEvent event) {  
+        log.info("OrderCreatedEvent with orderId" + event.getOrderId() + " productId " + event.getProductId());  
+        ReserveProductCommand reserveProductCommand = ReserveProductCommand  
+                .builder()  
+                .productId(event.getProductId())  
+                .orderId(event.getOrderId())  
+                .quantity(event.getQuantity())  
+                .userId(event.getUserId())  
+                .build();  
+  
+        commandGateway.send(reserveProductCommand, new CommandCallback<ReserveProductCommand, Object>() {  
+  
+            @Override  
+            public void onResult(@Nonnull CommandMessage<? extends ReserveProductCommand> commandMessage,  
+                                 @Nonnull CommandResultMessage<?> commandResultMessage  
+            ) {  
+                if(commandResultMessage.isExceptional()) {  
+                    //start compensation transaction  
+                }  
+            }  
+        });  
+    }  
+  
+    @SagaEventHandler(associationProperty = "orderId")  
+    public void handle(ProductReservedEvent productReservedEvent) {  
+        log.info("ProductReservedEvent with orderId" + productReservedEvent.getOrderId() + " productId " + productReservedEvent.getProductId());  
+        //Если такой event пришел в сагу, то, значит, что проблем при зарезервировании данных в products не было  
+    }  
+  
+  
+}
+```
+
+И самое интересное в том, что т.к. Axon Framework восстанавливает состояние ProductAggregate, то мы можем использовать quantity из него, а не идти в основную БД и получать из нее данные.
+```java
+@Aggregate  
+@NoArgsConstructor //требуется для Axon, т.к. он для восстановления объекта ProductAggregate будет создавать сначала пустой объект  
+public class ProductAggregate {  
+  
+    @AggregateIdentifier  
+    private String productId;  
+    private String title;  
+    private BigDecimal price;  
+    private Integer quantity;  
+  
+    //Т.к. команда по созданию product является по сути и инициатором создания Product Aggregate, поэтому мы используем конструктор для  
+    //обработки этой команды! Т.к. логично, что без Product нет смысла и в Aggregate классе, которым связан с этим Product объектом    @CommandHandler  
+    public ProductAggregate(CreateProductCommand createProductCommand) {  
+        ProductCreatedEvent productCreatedEvent = new ProductCreatedEvent();  
+        BeanUtils.copyProperties(createProductCommand, productCreatedEvent);  
+  
+        AggregateLifecycle.apply(productCreatedEvent);  
+    }  
+  
+    @CommandHandler  
+    public void handle(ReserveProductCommand reserveProductCommand) {  
+        //Мы можем здесь использовать текущее состояние Aggregate объекта! Потому что Axon Framework, используя Event Store  
+        //Сделает Replay наших эвентов в эвент сторе и тем самым восстановит состояние!        if(quantity < reserveProductCommand.getQuantity()) {  
+            throw new IllegalArgumentException("Insufficient number of items in stock");  
+        }  
+  
+        ProductReservedEvent productReservedEvent = ProductReservedEvent.builder()  
+                .orderId(reserveProductCommand.getOrderId())  
+                .productId(reserveProductCommand.getProductId())  
+                .quantity(reserveProductCommand.getQuantity())  
+                .userId(reserveProductCommand.getUserId())  
+                .build();  
+  
+        AggregateLifecycle.apply(productReservedEvent);  
+    }  
+  
+    @EventSourcingHandler  
+    public void on(ProductCreatedEvent productCreatedEvent) {  
+        this.productId = productCreatedEvent.getProductId();  
+        this.title = productCreatedEvent.getTitle();  
+        this.price = productCreatedEvent.getPrice();  
+        this.quantity = productCreatedEvent.getQuantity();  
+    }  
+  
+    @EventSourcingHandler  
+    public void on(ProductReservedEvent productReservedEvent) {  
+        this.quantity -= productReservedEvent.getQuantity();  
+    }  
+    }
+```
+
+![[Pasted image 20241121140529.png]]
+
+Дальше сможешь посмотреть в проекте, но логика повторялась. Создаем микросервис, в нем создаем AggregateObject, который принимает команду, которую посылает сага, валидирует ее, а потом создает эвент, который проходит через цепочки event handlers, которые реально делают какие-то бизнес действия и если все хорошо, то этот эвент доходит в сагу.
+
+### Saga. Compensating Transactions
+![[Pasted image 20241121173152.png]]
+Если произошла ошибка после передачи команды ProcessPaymentCommand, то мы должны выполнить компенсирующую транзакцию, чтобы отменить те действия, которые произошли до этой команды.
+![[Pasted image 20241121173326.png]]
+Также важным является то, что мы не должны делать компенсирующую транзакцию для шага, который не изменял как-либо нашу систему.
+![[Pasted image 20241121173457.png]]
+EventStore хранит эвенты, которые происходят в AggregateObject.
+Важно заметить, что когда мы будем выполнять компенсирующую транзакцию, мы не должны пытаться удалить что-либо из event store. Если event произошел, то он сохранится в event store.
+
+Причем если произошла какая-то ошибка при выполнении Saga, то нам не нужно удалять event из eventstore, мы просто создадим еще event, который также сохранится в event store.
