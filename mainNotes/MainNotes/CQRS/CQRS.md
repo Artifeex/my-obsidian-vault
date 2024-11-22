@@ -820,3 +820,169 @@ EventStore хранит эвенты, которые происходят в Agg
 Важно заметить, что когда мы будем выполнять компенсирующую транзакцию, мы не должны пытаться удалить что-либо из event store. Если event произошел, то он сохранится в event store.
 
 Причем если произошла какая-то ошибка при выполнении Saga, то нам не нужно удалять event из eventstore, мы просто создадим еще event, который также сохранится в event store.
+
+### Deadlines
+Deadline - это event, который произошел в том случае, если не произошел какой-то другой эвент, который мы ожидали.
+Например, мы отправил команду и ожидаем, что event произойдет в течение 24 часов и придет к нам. Но если так произошло, что ожидаемый event не произошел в заданный период времени(те же 24 часа), то мы хотим, чтобы произошел другой event - deadline. Это полезно для компенсирования, т.к. в Saga flow какие-то шаги могут занимать долгое время, то если за определенное время что-то не произошло, то нужно компенсировать изменения, которые произошли в saga.
+
+Deadline может быть использован как в Saga, так и в Aggregate классе.
+
+Deadlien event - по сути является тригером либо для изменения какого-то проперти, либо инициатором rollback транзакции.
+
+Если мы используем deadline в aggregate классе, то он не будет сохранен в event store.
+
+Тригерится только 1 раз.
+![[Pasted image 20241122092211.png]]
+
+Для создания Deadline нужен сначала DeadlineManager. Есть более простой SimpleDeadlineManager и QuartzDeadlineManager
+![[Pasted image 20241122092353.png]]
+- SimpleDeadlineManager - сохраняет deadlines в оперативной памяти и если наш сервер рестартнется, то дедлайны потеряются.
+- QuartzDeadlineManager - дополнительно сохраняет в памяти на диске и в случае рестарта дедлайны не потеряются.
+
+Чтобы создать deadline нужно использовать как раз DeadlineManager, который мы создали на прошлом шаге и в нем указать название дедлайна, время, через которого он должен произойти и payload(т.е. какая-то доп инфорамия, если нужна для нашего дедлайна, например, для запуска компенсирующей команды, в которую нужно передалть информцию, которую нужно компенсировать)
+
+Чтобы handle deadline создается @DeadlineHandler внутри которого указывается название дедлайна, указанного ранее при смоздании и принимает он в качестве параметра тот payload, который мы ожидаем.
+![[Pasted image 20241122092822.png]]
+
+А чтобы закенселить дедлайн в том случае, если ожидаемый эвент вызвался, то используем deadlineManager и кенселим. Причем можно как по id, так и закенселить все дедлайны по названию.
+```java
+private void cancelDeadline() {  
+    if(scheduleId != null) {  
+        deadlineManager.cancelSchedule(PAYMENT_PROCESSING_TIMEOUT_DEADLINE, scheduleId);  
+        scheduleId = null;  
+    }  
+  
+    //deadlineManager.cancelAll(PAYMENT_PROCESSING_TIMEOUT_DEADLINE); //отменяем дедлайн, поскольку обработка оплаты прошла  
+}
+```
+
+### Subscription Query
+Когда клиент вызвал Command, чтобы как-либо изменить состояние системы, то Read DB, которая находится на Query стороне не мгновенно получила изменения, мы же должны дождаться, когда придет event в query side, чтобы изменить уже БД. Но это занимает некоторое время и может получиться так, что клиент сразу же отправит запрос на получение той информации, которую он изменил, а она еще не изменилась и он получит старые данные. 
+
+Для решения такой проблемы придумали SubscriptionQuery, которая возвращает клиенту текущее состояние системы(именно в ReadDB), но также позволяет пользователю подписаться на обновления того ресурса, который ему вернулся после Query запроса. И если какие-то обновления произошли, то мы сообщим пользователю об обновлении. 
+
+И такая система будет работать, пока кто-нибудь не отменит подписку в subsription query.
+![[Pasted image 20241122100548.png]]
+
+И такая система может быть полезна для Saga. Мы можем сделать вызов COmmand, а потом получить результат уже вызовом Subsription Query. Т.е. когда Saga Flow закончится и обновление сделается, то мы можем сообщить пользователю о том, что все хорошо как раз с помощью subscription query.
+![[Pasted image 20241122101002.png]]
+
+Если мы хотим, чтобы наш Rest Controller дождался выполнения всего Saga Flow, то мы можем заинжектить в него Query Gateway, вызвать в нем subscription event и ждать, пока saga flow не закончится и не передаст нам updates и толкьо после этого мы вернем пользователю response.
+![[Pasted image 20241122101241.png]]
+
+```java
+@PostMapping  
+public OrderSummary createOrder(@Valid @RequestBody CreateOrderRestModel createOrderRestModel) {  
+    String userId = "27b95829-4f3f-4ddf-8983-151ba010e35b";  
+    String orderId = UUID.randomUUID().toString();  
+  
+    CreateOrderCommand createOrderCommand = CreateOrderCommand.builder()  
+            .productId(createOrderRestModel.getProductId())  
+            .quantity(createOrderRestModel.getQuantity())  
+            .orderStatus(OrderStatus.CREATED)  
+            .orderId(orderId)  
+            .addressId(createOrderRestModel.getAddressId())  
+            .userId(userId)  
+            .build();  
+  
+    //1-то, что вернется в первый раз при первом вызове  
+    //2-update query result - т.е. тот тип, в котором должны приходить обновления    SubscriptionQueryResult<OrderSummary, OrderSummary> queryResult = queryGateway.subscriptionQuery(new FindOrderQuery(orderId),  
+            ResponseTypes.instanceOf(OrderSummary.class),  
+            ResponseTypes.instanceOf(OrderSummary.class));  
+  
+    try {  
+        commandGateway.sendAndWait(createOrderCommand);  
+  
+        //updates() - возвращает flux - это что-то, что описываем наш OrderSummary. Т.е. в этот flux будут приходить обновления  
+        //blockFirst - блокирующее ожидание, ждем, пока в flux не придут обновления, а когда пришли, то все, возвращаем.        return queryResult.updates().blockFirst();  
+    } finally {  
+        queryResult.close();  
+    }  
+  
+}
+```
+
+И чтобы отправить в subscriptionQuery мы в Saga используем 
+```java
+//чтобы в subscription query сообщить об обновлениях ошибках и что больше не будет обновлений  
+@Autowired  
+private transient QueryUpdateEmitter queryUpdateEmitter;
+```
+
+И в методах, которые заканчивают наш Saga Flow мы сообщаем в subsucriptionQuery результаты.
+Причем и в случае неудачного эвента и в случае удачного
+```java
+@EndSaga  
+@SagaEventHandler(associationProperty = "orderId")  
+public void handle(OrderRejectedEvent orderRejectedEvent) {  
+    log.info("OrderRejectedEvent with orderId" + orderRejectedEvent.getOrderId());  
+    queryUpdateEmitter.emit(FindOrderQuery.class, query -> true,  
+            new OrderSummary(orderRejectedEvent.getOrderId(), orderRejectedEvent.getStatus(), orderRejectedEvent.getReason()));  
+}
+```
+
+```java
+@EndSaga  
+@SagaEventHandler(associationProperty = "orderId")  
+public void handle(OrderApprovedEvent orderApprovedEvent) {  
+    log.info("OrderApprovedEvent with orderId" + orderApprovedEvent.getOrderId());  
+  
+    //передаем в subscription query обновления  
+    queryUpdateEmitter.emit(FindOrderQuery.class, query -> true,  
+            new OrderSummary(orderApprovedEvent.getOrderId(), orderApprovedEvent.getOrderStatus(), ""));  
+    //SagaLifecycle.end();  
+}
+```
+
+И пользователь будет ждать ответа, а когда saga flow завершился, то получит такие результаты:
+![[Pasted image 20241122104940.png]]
+
+![[Pasted image 20241122105039.png]]
+
+### Snapshotting
+Snapshotting - это фича, которую предоставляет Axon Framework для того, чтобы оптимизировать загрузку events из event store. 
+Напомним, как все работает.
+
+В event store сохраняются все event-ы, которые как-либо изменяют состояние нашей бизнес сущности. Например, представим, что мы работаем с Product. Клиент вызвал создание нового продукта, мы создали команду, которую в AggregateObject приняли и создаем по сути новый AggregateObject и публикуем Event - ProductCreatedEvent. И вот этот event как раз сохранится в event store. И потом, когда пользователь захочет сделать обновление, то также вызовется команда, мы ее поймаем в AggregateObject, но теперь AggregateObject уже восстанавливается! Т.е. Axon создает сначала пустой AggregateObject(поля у него не заполнены значениями), а потом идет в EventStore, чтобы найти все event-ы, которые происходили с этим объектом и выполняет их последовательно(replay) и изменяет AggregateObject. В конце концов мы получаем AggregateObject, который соотвествует реальности(т.е. тому, что хранится в read БД).
+![[Pasted image 20241122110530.png]]
+Но с одним объектом может быть связано много изменений и тогда выполнение всех этих эвентов будет занимать много времени, чтобы восстановит состояние AggregateObject. (На самом деле на практике нечасто происходит такое, что какие-то сущности постоянно обновляются и плодится очень много эвентов с изменением этой сущности, но такие ситуации возникают). Поэтому и был придуман механизм Snapshots.
+
+Мы можем настроить, когда Axon будет выполнять создание Snapshot. Это может быть раз в некоторый временной интервал(например, в конце дня) или после определенного числа event-ов, которые произошли с объектом или если загрузка текущего состояние объекта через последовательное выполнение операций в event store занимает больше времени, чем мы задали.
+
+Сам механизм работы теперь такой, что Axon в зависимости от настройки создает Snapshot(по сути просто сериализует текущее состояние нашего AggregateObject и сохраняет его). И потом, когда нужно выполнить обновление, то он идет сразу в snapshots для нашего AggregateObject, восстанавливает его состояние через этот snapshot и не вызывает events, которые происходили до этого snapshot, через который мы восстановили наш AggregateObject.
+![[Pasted image 20241122111454.png]]
+
+Создаем бин - тригер, в котором как раз определяем, когда будет вызываться этот тригер по созданию снапшота. На примере ниже мы настроили так, что раз в 500 эвентов будет создаваться snapshot. 
+![[Pasted image 20241122111917.png]]
+
+И мы также указываем имя для этого бина, чтобы в AggregateObject настроить то, когда будут делаться snapshots:
+![[Pasted image 20241122112127.png]]
+
+Чтобы проследить, что происходит с event store мы можем либо воспользоваться dashboard axon, либо выбрать уровень логирования:
+![[Pasted image 20241122112805.png]]
+
+### Replaying Events
+Одно из преимуществ использования Event-sourcing подхода - это то, что у нас хранится история изменения состояния нашего приложения. 
+Благодаря этому мы можем заребилдить состояние нашей ReadDB.
+
+EventStore - это источник правды! А вот ReadDB, это просто проекция этого источника на ReadБД. В Read DB мы храним просто текущее состояние нашей системы. 
+
+С помощью Replaying Events мы просто будет выполнять эти эвенты с самого начала, т.е. по новой будут вызываться EventHandlers и восстанавливать состояние БД. Например, это может быть полезно, когда мы добавили новый столбец в таблицу - дата последнего обновления. При добавлении этот столбец будет пустым для всей таблицы. Но благодаря тому, что мы можем сделать Replaying Events, то мы сможем заполнить этот столбец!
+![[Pasted image 20241122114234.png]]
+
+Также полезным может быть, если мы решили создать новую БД, которая будет хранить какое-то другое представление нашей сущности, может быть, более сокращенное или наоборот подробное. Тогда мы создаем новые EventHandlers, которые уже будут работать с новой БД, а затем просим Axon произвести replaying events, тогда мы в этих хендлерах будет обновлять эту новую БД.
+
+Также важным замечанием является то, что мы можем делать replaying не с нуля, а с определенного периода времени.
+![[Pasted image 20241122114506.png]]
+
+Особенности:
+![[Pasted image 20241122114907.png]]
+- @ResetHandler - можем пометить метод, который должен быть вызван перед тем, как будет произведен replay. Например, он может почистить БД, в которую мы будем потом через replay что-то добавлять
+- Для реплеинга поддерживается только Tracking Event Processor, который нужно остановить перед реплеингом и почистить.
+- DisallowReplay - чтобы не все event handlers срабатывали, поскольку, например, если какой-то event handler отвечал за отправку сообщений клиенту, то мы не хотим, чтобы это еще раз выполнилось.
+
+Вот так выглядит процедура перезапуска в коде:
+![[Pasted image 20241122120400.png]]
+Но также нужно не забыть переключить на другом mod event processor для нашей группы, т.к. subscribing не поддерживает replaying функцию. Но мы можем временно включить tracking, чтобы выполнить replay, а потом обратно вернуть subscribing.
+![[Pasted image 20241122120525.png]]
+
