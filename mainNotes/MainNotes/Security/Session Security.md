@@ -21,3 +21,12 @@
 
 Итог:
 ![[Pasted image 20241224180428.png]]
+
+### Session Hijacking, Session Fixation
+Session Hijacking - это когда злоумышленник может украсть JSESSIONID. Украсть он может во время передачи данных по сети(чтобы избежать этого - нужно использовать HTTPS), а также если получил доступ к компьютеру пользователя или данных браузера.
+
+Session Fixation
+![[Pasted image 20241225092917.png]]
+Spring по умолчанию защищен от Session Fixation атаки:
+![[Pasted image 20241225093008.png]]
+changeSessionId - это стратегия в Spring по умолчанию.

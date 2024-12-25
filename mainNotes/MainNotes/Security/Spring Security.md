@@ -308,3 +308,9 @@ Spring при использовании энкодеров оказываетс
 ### [[ExceptionHandlingSpringSecurity]]
 
 ### [[Session Security]]
+
+### [[Authentication Events]]
+
+### [[Security Context & Security Context Holder]]
+
+### [[CORS & CSRF]]
