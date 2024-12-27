@@ -314,3 +314,9 @@ Spring при использовании энкодеров оказываетс
 ### [[Security Context & Security Context Holder]]
 
 ### [[CORS & CSRF]]
+
+### [[Authorization]]
+
+### [[Custom Filters]]
+
+### [[JWT Authentication]]
